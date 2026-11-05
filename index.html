@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hapag-Lloyd Egypt | Manifest Checker</title>
+<style>
+*{box-sizing:border-box}body{font-family:Tahoma,Arial,sans-serif;background:#f3f6fa;color:#182433;margin:0}
+main{max-width:760px;margin:45px auto;padding:24px}
+.card{background:white;border:1px solid #dce4ee;border-radius:18px;padding:28px;box-shadow:0 8px 28px #1322380c}
+h1{margin:0 0 8px;color:#092d54;font-size:25px}p{color:#5b6b7d;line-height:1.8}
+.drop{margin:24px 0;padding:32px;border:2px dashed #8ba8c8;border-radius:14px;text-align:center;background:#f8fbff}
+input{max-width:100%;margin:15px}
+button{background:#0b477d;color:white;border:0;border-radius:9px;padding:13px 22px;font-size:16px;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}
+#status{margin-top:18px;font-weight:bold;white-space:pre-wrap}
+.small{font-size:13px}
+</style></head>
+<body><main><div class="card">
+<h1>Hapag-Lloyd Egypt — Manifest Checker</h1>
+<p>ارفع ملف المانيفست PDF وسيتم استخراج بيانات البوالص والحاويات وتطبيق الرولز، ثم تحميل تقرير Excel.</p>
+<div class="drop">
+<strong>اختار ملف Manifest بصيغة PDF</strong><br>
+<input id="pdf" type="file" accept="application/pdf,.pdf">
+<br><button id="go" disabled>تحليل المانيفست وتحميل Excel</button>
+</div>
+<p class="small">ملاحظة: تتم معالجة الملف على الخادم. قد تفشل الملفات الكبيرة جدًا بسبب حدود استضافة Vercel.</p>
+<div id="status"></div>
+</div></main>
+<script>
+const input=document.getElementById('pdf'), btn=document.getElementById('go'), status=document.getElementById('status');
+input.addEventListener('change',()=>{btn.disabled=!(input.files&&input.files[0]);status.textContent='';});
+btn.addEventListener('click',async()=>{
+ const file=input.files[0]; if(!file)return;
+ btn.disabled=true; status.textContent='جاري تحليل الملف... قد يستغرق وقتًا حسب عدد الصفحات.';
+ try{
+  const fd=new FormData();fd.append('file',file);
+  const res=await fetch('/api/process',{method:'POST',body:fd});
+  if(!res.ok){let msg=await res.text();throw new Error(msg||'حدث خطأ أثناء المعالجة');}
+  const blob=await res.blob();const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;
+  a.download=file.name.replace(/\.pdf$/i,'')+'_checked.xlsx';
+  document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+  status.textContent='تم التحليل وتحميل ملف Excel بنجاح.';
+ }catch(e){status.textContent='تعذر الاتصال ببرنامج Python.\nتأكد من تشغيل server.py ثم أعد المحاولة.\nالتفاصيل: '+e.message;}
+ finally{btn.disabled=false;}
+});
+</script></body></html>
