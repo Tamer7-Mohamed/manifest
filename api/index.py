@@ -2,25 +2,26 @@
 from flask import Flask, request, jsonify, send_file
 import os
 import sys
-import json
 import tempfile
 import traceback
 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 import manifest_to_excel_hapag_egypt as parser
 
 app = Flask(__name__)
 
+
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({
-        "status": "online",
-        "message": "Hapag-Lloyd Egypt Manifest Checker"
-    })
+    return jsonify({"status": "API is working"})
 
-@app.route("/api/process", methods=["POST"])
-def process_manifest():
+
+@app.route("/<path:path>", methods=["POST"])
+@app.route("/", methods=["POST"])
+def process_manifest(path=""):
+
     if "file" not in request.files:
         return jsonify({"error": "لم يتم إرسال ملف PDF"}), 400
 
@@ -38,11 +39,9 @@ def process_manifest():
             uploaded_file.save(tmp)
             temp_pdf = tmp.name
 
-        # فتح ملف PDF
         total_pages = parser.open_pdf(temp_pdf)
 
-        # معالجة الصفحات على دفعات لتقليل استهلاك الذاكرة
-        batch_size = 30
+        batch_size = 15
         all_parts = []
 
         for start in range(0, total_pages, batch_size):
@@ -50,15 +49,12 @@ def process_manifest():
             result = parser.process(start, end)
             all_parts.append(result)
 
-        # إنشاء ملف Excel النهائي
-        parser.finish(json.dumps(all_parts))
+        parser.finish(__import__("json").dumps(all_parts))
 
         output_path = "/tmp/out.xlsx"
 
-        if not os.path.exists(output_path):
-            return jsonify({
-                "error": "لم يتم إنشاء ملف Excel"
-            }), 500
+        if not os.path.isfile(output_path):
+            return jsonify({"error": "لم يتم إنشاء ملف Excel"}), 500
 
         return send_file(
             output_path,
@@ -75,6 +71,13 @@ def process_manifest():
         }), 500
 
     finally:
+        try:
+            if parser._pdf is not None:
+                parser._pdf.close()
+                parser._pdf = None
+        except Exception:
+            pass
+
         if temp_pdf and os.path.exists(temp_pdf):
             try:
                 os.remove(temp_pdf)
