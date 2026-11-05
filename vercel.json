@@ -7,10 +7,6 @@
   },
   "rewrites": [
     {
-      "source": "/",
-      "destination": "/index.html"
-    },
-    {
       "source": "/api/process",
       "destination": "/api/index.py"
     }
