@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-استخراج بيانات المانيفست من PDF (نص حقيقي) إلى Excel، صف لكل بوليصة.
+استخراج بيانات المانيفست من PDF (نص حقيقي) إلى Excel، صف لكل بوليصة،
+مع تطبيق رولز Hapag-Lloyd Egypt.
 
 التثبيت (مرة واحدة):
     pip install pdfplumber pandas openpyxl
 
 الاستخدام:
-    python manifest_to_excel.py file.pdf              -> file.xlsx
-    python manifest_to_excel.py file.pdf out.xlsx
-    python manifest_to_excel.py file.pdf --raw        -> يطبع النص الخام للتشخيص
+    python manifest_to_excel_hapag_egypt.py file.pdf              -> file.xlsx
+    python manifest_to_excel_hapag_egypt.py file.pdf out.xlsx
+    python manifest_to_excel_hapag_egypt.py file.pdf --raw        -> يطبع النص الخام للتشخيص
 """
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 import pdfplumber
 from openpyxl import Workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill
 
 # ===== للتشغيل من VS Code: اكتب مسار الـ PDF هنا (بين علامتي التنصيص) واضغط Run =====
 # مثال: PDF_PATH = r"C:\Users\FORMAT\Desktop\CAMN0001_605702373.pdf"
@@ -261,6 +263,7 @@ def find_flags(full_lines):
     """يدوّر على ترانزيت / فري زون في بيانات البوليصة (بدون صفحات الشروط CLAUSES)."""
     end = next((i for i, l in enumerate(full_lines) if "CLAUSES" in l), len(full_lines))
     body = full_lines[:end]
+
     def hits(rx):
         out = []
         for l in body:
@@ -394,7 +397,7 @@ def parse_block(b):
         "Notify": " | ".join(notify), "Notify ID": consignee_id if "SAME AS CONSIGNEE" in " ".join(notify) else find_id(notify),
         "ACID": acid, "Place of Receipt": por, "Place of Delivery": pod,
         "Transit": transit, "Free Zone": freezone, "Part of 2 Cargo": "YES" if _part_of_two(alltxt) else "",
-        "Containers": " ; ".join(a+"  "+ b_ for a, b_, _ in conts),
+        "Containers": " ; ".join(a + "  " + b_ for a, b_, _ in conts),
         "Seals": " ; ".join(seals),
         "HS Code": " ; ".join(dict.fromkeys(hs)),
         "Commodity Code": " ; ".join(dict.fromkeys(comm)),
@@ -404,7 +407,7 @@ def parse_block(b):
     }
     g = lambda lst, i: lst[i] if i < len(lst) else ""
     details = [{
-        "BL": bl, "Container": a+"  "+ b_, "Type": t, "Seal": g(seals, i),
+        "BL": bl, "Container": a + "  " + b_, "Type": t, "Seal": g(seals, i),
         "Tare": g(tare, i), "Cartons": g(cartons, i),
         "Gross KGM": g(gross, i), "Volume MTQ": g(vol, i), "HS Code": g(hs, i),
     } for i, (a, b_, t) in enumerate(conts)]
@@ -455,101 +458,182 @@ def process(a, b):
     return json.dumps(blocks)
 
 
-
 # ===================== HAPAG-LLOYD EGYPT RULES =====================
-# Rules requested by user:
-# 1) Hapag-Lloyd Egypt import only: flag destination not EGDAM (review, not automatic rejection).
-# 2) Shipper must be non-Egyptian.
-# 3) 20' container gross cargo weight must not exceed 25,000 kg.
-# 4) 20' container marked "1 OF 2 PART CARGOES" with 25,000 kg is flagged.
-# 5) Missing/duplicate BL, ACID, container, or seal; shipper ID-country mismatch.
-# NOTE: 40' cargo limits were not supplied by user; therefore no invented threshold is applied.
+MAX_20_KG = 25000       # حد وزن حاوية 20'
+SHARED_20_KG = 24000    # حاوية 20' مشتركة بين بوليصتين: خطأ لو أي وزن >= الرقم ده
+MAX_40_KG = 50000       # حد وزن حاوية 40' (غيّره هنا لو الحد الفعلي مختلف)
+
+ERR, WARN = "خطأ", "تنبيه"
+
+_EGYPT_RE = re.compile(
+    r"\bEGYPT\b|\bEG\b|\bCAIRO\b|\bALEXANDRIA\b|\bGIZA\b|\bDAMIETTA\b|\bPORT\s*SAID\b|\bSUEZ\b"
+    r"|\bSOKHNA\b|\bISMAILIA\b|\bTANTA\b|\bMANSOURA\b|\bOBOUR\b|\bHELIOPOLIS\b|\bNASR\s*CITY\b"
+    r"|\bMAADI\b|\b10TH OF RAMADAN\b|\b6TH OF OCTOBER\b|مصر|القاهرة|الإسكندرية|الاسكندرية")
+_BANK_RE = re.compile(r"\bBANK\b|\bBANQUE\b|\bBANCO\b|\bBANCA\b|\bBANKING\b|بنك|مصرف")
+
 
 def _norm(v):
     return re.sub(r"\s+", " ", str(v or "")).strip().upper()
 
-def _is_20ft(container_type, container_no=""):
+
+def _num(v):
+    try:
+        return float(str(v).replace(",", "")) if v not in ("", None) else None
+    except Exception:
+        return None
+
+
+def _size(container_type):
+    """يرجّع 20 أو 40 أو None (لو النوع مش معروف)."""
     t = _norm(container_type)
-    c = _norm(container_no)
-    return bool(re.search(r"(?:^|[^0-9])20(?:GP|G[0-9]|R[0-9]|HC|OT|FR|DV|DC|[^0-9]|$)", t)) or (
-        bool(re.search(r"\b20\b", t)) or bool(re.search(r"\b20(?:'|FT)\b", c))
-    )
+    if re.match(r"^20", t) or re.match(r"^2\d[A-Z]\d$", t) or re.search(r"\b20\b|20\s*'|20FT", t):
+        return 20
+    if re.match(r"^(40|45|48)", t) or re.match(r"^[4LM]\d[A-Z]\d$", t) or re.search(r"\b(40|45)\b|40FT", t):
+        return 40
+    return None
+
 
 def _part_of_two(text):
     t = _norm(text)
     return bool(re.search(r"1\s+OF\s+2\s+PART\s+CARGO|1\s*/\s*2\s+PART\s+CARGO|PART\s+OF\s+2", t))
 
-def _issue(bl, rule, details):
-    return {"B/L": bl, "Rule": rule, "Details": details}
+
+def _is_egypt_text(text):
+    t = _norm(text)
+    if _EGYPT_RE.search(t):
+        return True
+    return any(COUNTRIES[c] == "EG" for c in _CRE.findall(t))
+
+
+def _issue(bl, rule, details, sev=ERR):
+    return {"Severity": sev, "B/L": bl, "Rule": rule, "Details": details}
+
 
 def build_rule_issues(summaries, details):
     issues = []
-    # Duplicate BL / ACID
-    bl_counts = {}
-    acid_counts = {}
+    sum_by_bl, det_by_bl = {}, {}
     for s in summaries:
-        bl = _norm(s.get("BL"))
-        acid = _norm(s.get("ACID"))
-        if bl: bl_counts[bl] = bl_counts.get(bl, 0) + 1
-        if acid: acid_counts[acid] = acid_counts.get(acid, 0) + 1
+        sum_by_bl.setdefault(_norm(s.get("BL")), s)
+    for d in details:
+        det_by_bl.setdefault(_norm(d.get("BL")), []).append(d)
+    bl_counts = Counter(_norm(s.get("BL")) for s in summaries if _norm(s.get("BL")))
+    acid_counts = Counter(_norm(s.get("ACID")) for s in summaries if _norm(s.get("ACID")))
+    done = set()
+
     for s in summaries:
         bl = s.get("BL", "")
+        nbl = _norm(bl)
+        first = nbl not in done
+        done.add(nbl)
+
+        # ---- بيانات أساسية ----
+        if first and bl_counts.get(nbl, 0) > 1:
+            issues.append(_issue(bl, "Duplicate B/L", f"ظهر {bl_counts[nbl]} مرات في المانيفست"))
         acid = _norm(s.get("ACID"))
-        if bl_counts.get(_norm(bl), 0) > 1:
-            issues.append(_issue(bl, "Duplicate B/L", f"ظهر {bl_counts[_norm(bl)]} مرات في المانيفست"))
         if not acid:
             issues.append(_issue(bl, "Missing ACID", "لا يوجد رقم ACID مستخرج"))
         elif acid_counts.get(acid, 0) > 1:
             issues.append(_issue(bl, "Duplicate ACID", f"رقم ACID {acid} مكرر {acid_counts[acid]} مرات"))
 
-        shipper_country = _norm(s.get("Shipper Country"))
-        if shipper_country in ("EGYPT", "EG"):
-            issues.append(_issue(bl, "Egyptian Shipper", "الشاحن مصري؛ القاعدة المطلوبة: الشاحن غير مصري"))
+        # ---- الشاحن لازم يكون برا مصر ----
+        code = s.get("Shipper Country Code", "")
+        if code == "EG":
+            issues.append(_issue(bl, "Egyptian Shipper", "الشاحن مصري؛ المطلوب شاحن من خارج مصر"))
+        elif not code:
+            issues.append(_issue(bl, "Shipper country unknown", "تعذر تحديد دولة الشاحن، راجع المانيفست", WARN))
+        elif _is_egypt_text(s.get("Shipper")):
+            issues.append(_issue(bl, "Shipper address mentions Egypt",
+                                 f"دولة الشاحن المستخرجة {code} لكن العنوان فيه إشارة لمصر: {s.get('Shipper')}", WARN))
         if not _norm(s.get("Shipper ID")):
             issues.append(_issue(bl, "Missing Shipper ID", "راجع بيانات الشاحن / Shipper ID"))
         if _norm(s.get("Shipper ID Check")) == "راجع المانيفست":
             issues.append(_issue(bl, "Shipper ID / Country mismatch", "كود الشاحن لا يتوافق مع دولة الشاحن المستخرجة"))
+
+        # ---- المستلم لازم يكون مصري أو بنك ----
+        cons = s.get("Consignee")
+        if not _norm(cons):
+            issues.append(_issue(bl, "Missing Consignee", "لا يوجد Consignee مستخرج"))
+        elif not (_is_egypt_text(cons) or _BANK_RE.search(_norm(cons))):
+            issues.append(_issue(bl, "Consignee not Egypt / not a bank", f"المستلم: {cons}"))
+
+        # ---- الوجهة ----
         pod = _norm(s.get("Place of Delivery"))
-        if pod and "EGDAM" not in pod and "DAM" not in pod and "EGYPT" not in pod:
-            issues.append(_issue(bl, "Destination review – Egypt only", f"مكان التسليم المستخرج: {pod}"))
+        if pod and not re.search(r"\bEGDAM\b|DAMIETTA", pod):
+            issues.append(_issue(bl, "Destination not EGDAM", f"مكان التسليم المستخرج: {pod}", WARN))
 
-        # Missing seals per container
-        bl_details = [d for d in details if _norm(d.get("BL")) == _norm(bl)]
-        if bl_details:
-            for d in bl_details:
-                if not _norm(d.get("Seal")):
-                    issues.append(_issue(bl, "Missing Seal", f"الحاوية {d.get('Container','')} لا يوجد لها Seal مستخرج"))
+        # ---- ترانزيت / فري زون: تنبيه فقط ----
+        if s.get("Transit"):
+            issues.append(_issue(bl, "Transit", f"تنبيه: البوليصة فيها ترانزيت → {s.get('Transit')}", WARN))
+        if s.get("Free Zone"):
+            issues.append(_issue(bl, "Free Zone", f"تنبيه: البوليصة فيها فري زون → {s.get('Free Zone')}", WARN))
 
-    # Duplicate containers across all BLs
-    cont_counts = {}
-    for d in details:
-        cont = _norm(d.get("Container"))
-        if cont: cont_counts[cont] = cont_counts.get(cont, 0) + 1
-    for d in details:
-        cont = _norm(d.get("Container"))
-        if cont_counts.get(cont, 0) > 1:
-            issues.append(_issue(d.get("BL",""), "Duplicate Container", f"{cont} مكرر {cont_counts[cont]} مرات"))
-
-    # Weight and part-of-two checks
-    for s in summaries:
-        bl = s.get("BL", "")
-        bl_details = [d for d in details if _norm(d.get("BL")) == _norm(bl)]
+        # ---- فحوصات الحاويات (مرة واحدة لكل بوليصة) ----
+        if not first:
+            continue
+        rows = det_by_bl.get(nbl, [])
+        if not rows:
+            issues.append(_issue(bl, "No containers found", "لم يتم استخراج أي حاوية لهذه البوليصة", WARN))
         part2 = bool(s.get("Part of 2 Cargo"))
-        for d in bl_details:
-            wt = d.get("Gross KGM")
-            try:
-                weight = float(str(wt).replace(",", "")) if wt not in ("", None) else None
-            except Exception:
-                weight = None
-            if _is_20ft(d.get("Type", ""), d.get("Container", "")):
-                if weight is None:
-                    issues.append(_issue(bl, "20' weight missing", f"تعذر قراءة الوزن للحاوية {d.get('Container','')}"))
-                elif weight > 25000:
-                    issues.append(_issue(bl, "20' overweight > 25,000 kg", f"{d.get('Container','')}: {weight:,.3f} kg"))
-                if part2 and weight is not None and weight >= 25000:
-                    issues.append(_issue(bl, "20' Part-of-2 cargo at 25 tons", f"{d.get('Container','')}: {weight:,.3f} kg؛ مراجعة خاصة"))
+        for d in rows:
+            cno, w, size = d.get("Container", ""), _num(d.get("Gross KGM")), _size(d.get("Type"))
+            if not _norm(d.get("Seal")):
+                issues.append(_issue(bl, "Missing Seal", f"الحاوية {cno} لا يوجد لها Seal مستخرج"))
+            if w is None:
+                issues.append(_issue(bl, "Weight missing", f"تعذر قراءة الوزن للحاوية {cno}", WARN))
+            if size is None:
+                issues.append(_issue(bl, "Container size unknown",
+                                     f"تعذر تحديد حجم الحاوية {cno} (النوع: {d.get('Type', '')})", WARN))
+            if size == 20 and w is not None:
+                if w > MAX_20_KG:
+                    issues.append(_issue(bl, "20' overweight", f"{cno}: {w:,.0f} kg (الحد {MAX_20_KG:,})"))
+                if part2 and w >= MAX_20_KG:
+                    issues.append(_issue(bl, "20' Part-of-2 cargo at 25 tons", f"{cno}: {w:,.0f} kg؛ مراجعة خاصة"))
+            if size == 40 and w is not None and w > MAX_40_KG:
+                issues.append(_issue(bl, "40' overweight", f"{cno}: {w:,.0f} kg (الحد {MAX_40_KG:,})"))
+
+    # ---- حاوية على أكتر من بوليصة ----
+    by_cont = {}
+    for d in details:
+        c = _norm(d.get("Container"))
+        if c:
+            by_cont.setdefault(c, []).append(d)
+    fields = [("Shipper", "الشاحن"), ("Shipper ID", "رقم الشاحن"), ("Consignee", "المستلم"),
+              ("Consignee ID", "رقم المستلم"), ("Notify", "النوتيفاي"),
+              ("Place of Receipt", "مكان الاستلام"), ("Place of Delivery", "مكان التسليم")]
+    for c, rows in by_cont.items():
+        bls = list(dict.fromkeys(d.get("BL", "") for d in rows))
+        if len(bls) == 1:
+            if len(rows) > 1:
+                issues.append(_issue(bls[0], "Container repeated in same B/L", f"{c} ظهرت {len(rows)} مرات في نفس البوليصة", WARN))
+            continue
+        label = " / ".join(bls)
+        weights = [_num(d.get("Gross KGM")) for d in rows]
+        wtxt = " | ".join(f"{d.get('BL', '')}: {w:,.0f} kg" if w is not None else f"{d.get('BL', '')}: وزن غير مقروء"
+                          for d, w in zip(rows, weights))
+        diffs = []
+        for key, name in fields:
+            if len({_norm(sum_by_bl.get(_norm(b), {}).get(key)) for b in bls}) > 1:
+                diffs.append(name)
+        if len({_norm(d.get("Seal")) for d in rows}) > 1:
+            diffs.append("الـ Seal")
+        acids = {_norm(sum_by_bl.get(_norm(b), {}).get("ACID")) for b in bls}
+        acid_txt = "نفس الـ ACID" if len(acids) == 1 else "ACID مختلف"
+        if not diffs:
+            issues.append(_issue(label, "Shared container – identical parties",
+                                 f"{c} مشتركة بين {len(bls)} بوالص بنفس الشاحن والمستلم والنوتيفاي والموانئ والـ Seal ({acid_txt}) — {wtxt}", WARN))
+        else:
+            issues.append(_issue(label, "Shared container – different parties",
+                                 f"{c} مشتركة بين {len(bls)} بوالص ومختلفة في: {'، '.join(diffs)} ({acid_txt}) — {wtxt}"))
+        size = next((z for z in (_size(d.get("Type")) for d in rows) if z), None)
+        if size == 20:
+            if any(w is not None and w >= SHARED_20_KG for w in weights):
+                issues.append(_issue(label, "20' shared container – weight >= 24t", f"{c}: {wtxt}"))
+            if any(w is None for w in weights):
+                issues.append(_issue(label, "20' shared container – weight missing", f"{c}: {wtxt}", WARN))
+
+    issues.sort(key=lambda i: i["Severity"] != ERR)
     return issues
-# =================================================================
+
 
 def finish(parts_json):
     """يجمّع الدفعات بالترتيب، يلزق البلوكات المقسومة، يعمل parse ويكتب /tmp/out.xlsx."""
@@ -575,12 +659,29 @@ def finish(parts_json):
             errors.append({"First line": b["left"][0].strip()[:80], "Error": repr(e)})
 
     rule_issues = build_rule_issues(summaries, details)
-    wb = Workbook()
-    sheets = [("Manifest", summaries), ("Containers", details)]
-    if rule_issues:
-        sheets.append(("Rule Issues", rule_issues))
+    n_err = sum(1 for i in rule_issues if i["Severity"] == ERR)
+    n_warn = len(rule_issues) - n_err
+
+    summary_rows = [
+        {"Item": "عدد البوالص", "Severity": "", "Count": len(summaries)},
+        {"Item": "عدد الحاويات", "Severity": "", "Count": len(details)},
+        {"Item": "بوالص فشلت قراءتها (شيت Errors)", "Severity": "", "Count": len(errors)},
+        {"Item": "إجمالي الأخطاء", "Severity": ERR, "Count": n_err},
+        {"Item": "إجمالي التنبيهات", "Severity": WARN, "Count": n_warn},
+    ]
+    cnt = Counter((i["Severity"], i["Rule"]) for i in rule_issues)
+    for (sev, rule), n in sorted(cnt.items(), key=lambda x: (x[0][0] != ERR, -x[1])):
+        summary_rows.append({"Item": rule, "Severity": sev, "Count": n})
+
+    issues_rows = rule_issues or [{"Severity": "", "B/L": "", "Rule": "لا توجد ملاحظات", "Details": ""}]
+    sheets = [("Summary", summary_rows), ("Manifest", summaries), ("Containers", details),
+              ("Rule Issues", issues_rows)]
     if errors:
         sheets.append(("Errors", errors))
+
+    red = PatternFill("solid", fgColor="F8CBAD")
+    yellow = PatternFill("solid", fgColor="FFF2CC")
+    wb = Workbook()
     for i, (name, rows) in enumerate(sheets):
         ws = wb.active if i == 0 else wb.create_sheet()
         ws.title = name
@@ -600,6 +701,15 @@ def finish(parts_json):
             ws.append(vals)
         for c in ws[1]:
             c.font = Font(bold=True)
+        if name in ("Rule Issues", "Summary"):
+            for row in ws.iter_rows(min_row=2):
+                sev = row[0].value if name == "Rule Issues" else row[1].value
+                if sev == ERR:
+                    for c in row:
+                        c.fill = red
+                elif sev == WARN:
+                    for c in row:
+                        c.fill = yellow
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
         for k, w in enumerate(widths):
@@ -639,6 +749,9 @@ def main():
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         pd.DataFrame(summaries).to_excel(xw, sheet_name="Manifest", index=False)
         pd.DataFrame(details).to_excel(xw, sheet_name="Containers", index=False)
+        pd.DataFrame(build_rule_issues(summaries, details) or
+                     [{"Severity": "", "B/L": "", "Rule": "لا توجد ملاحظات", "Details": ""}]
+                     ).to_excel(xw, sheet_name="Rule Issues", index=False)
         for ws in xw.book.worksheets:  # عرض أعمدة مناسب
             for col in ws.columns:
                 w = max(len(str(c.value or "")) for c in col)
