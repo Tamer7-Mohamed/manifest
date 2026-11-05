@@ -27,22 +27,68 @@ button:disabled{opacity:.5;cursor:not-allowed}
 <p class="small">ملاحظة: تتم معالجة الملف على الخادم. قد تفشل الملفات الكبيرة جدًا بسبب حدود استضافة Vercel.</p>
 <div id="status"></div>
 </div></main>
+
 <script>
-const input=document.getElementById('pdf'), btn=document.getElementById('go'), status=document.getElementById('status');
-input.addEventListener('change',()=>{btn.disabled=!(input.files&&input.files[0]);status.textContent='';});
-btn.addEventListener('click',async()=>{
- const file=input.files[0]; if(!file)return;
- btn.disabled=true; status.textContent='جاري تحليل الملف... قد يستغرق وقتًا حسب عدد الصفحات.';
- try{
-  const fd=new FormData();fd.append('file',file);
-  const res=await fetch('/api/process',{method:'POST',body:fd});
-  if(!res.ok){let msg=await res.text();throw new Error(msg||'حدث خطأ أثناء المعالجة');}
-  const blob=await res.blob();const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');a.href=url;
-  a.download=file.name.replace(/\.pdf$/i,'')+'_checked.xlsx';
-  document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
-  status.textContent='تم التحليل وتحميل ملف Excel بنجاح.';
- }catch(e){status.textContent='تعذر الاتصال ببرنامج Python.\nتأكد من تشغيل server.py ثم أعد المحاولة.\nالتفاصيل: '+e.message;}
- finally{btn.disabled=false;}
+const input = document.getElementById('pdf');
+const btn = document.getElementById('go');
+const status = document.getElementById('status');
+
+// رابط API المنشور على Vercel
+const API_URL = 'https://manifest-k8la.vercel.app/api/process';
+
+input.addEventListener('change', () => {
+    btn.disabled = !(input.files && input.files[0]);
+    status.textContent = '';
 });
-</script></body></html>
+
+btn.addEventListener('click', async () => {
+    const file = input.files[0];
+    if (!file) return;
+
+    btn.disabled = true;
+    status.textContent = 'جاري رفع وتحليل المانيفست... برجاء الانتظار.';
+
+    try {
+        const fd = new FormData();
+        fd.append('file', file);
+
+        const res = await fetch(API_URL, {
+            method: 'POST',
+            body: fd
+        });
+
+        if (!res.ok) {
+            const msg = await res.text();
+            throw new Error(msg || 'خطأ في معالجة الملف على السيرفر');
+        }
+
+        const blob = await res.blob();
+
+        if (blob.size === 0) {
+            throw new Error('السيرفر رجّع ملف Excel فارغ');
+        }
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+
+        a.href = url;
+        a.download = file.name.replace(/\.pdf$/i, '') + '_checked.xlsx';
+
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        setTimeout(() => URL.revokeObjectURL(url), 3000);
+
+        status.textContent = 'تم التحليل وتحميل تقرير Excel بنجاح.';
+
+    } catch (e) {
+        status.textContent =
+            'حدث خطأ أثناء التحليل.\n' +
+            'التفاصيل: ' + e.message;
+    } finally {
+        btn.disabled = false;
+    }
+});
+</script>
+</body></html>
