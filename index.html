@@ -34,8 +34,7 @@ const btn = document.getElementById('go');
 const status = document.getElementById('status');
 
 // رابط API المنشور على Vercel
-const API_URL = 'https://manifest-k8la.vercel.app/api/process';
-
+const API_URL = '/api/process';
 input.addEventListener('change', () => {
     btn.disabled = !(input.files && input.files[0]);
     status.textContent = '';
